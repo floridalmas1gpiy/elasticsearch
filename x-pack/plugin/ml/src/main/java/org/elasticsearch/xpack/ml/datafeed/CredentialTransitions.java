@@ -36,6 +36,7 @@ import org.elasticsearch.xpack.ml.notifications.AnomalyDetectionAuditor;
 
 import java.util.Map;
 import java.util.function.BiConsumer;
+import java.util.function.Supplier;
 
 import static org.elasticsearch.xpack.core.ClientHelper.ML_ORIGIN;
 import static org.elasticsearch.xpack.core.ClientHelper.executeWithHeadersAsync;
@@ -79,23 +80,23 @@ public final class CredentialTransitions {
     ) {}
 
     private final AnomalyDetectionAuditor auditor;
-    private final InternalCloudApiKeyService apiKeyService;
-    private final CloudCredentialManager credentialManager;
+    private final Supplier<InternalCloudApiKeyService> apiKeyServiceSupplier;
+    private final Supplier<CloudCredentialManager> credentialManagerSupplier;
     private final Client client;
     private final NamedXContentRegistry xContentRegistry;
     private final DatafeedConfigProvider datafeedConfigProvider;
 
     public CredentialTransitions(
         AnomalyDetectionAuditor auditor,
-        InternalCloudApiKeyService apiKeyService,
-        CloudCredentialManager credentialManager,
+        Supplier<InternalCloudApiKeyService> apiKeyServiceSupplier,
+        Supplier<CloudCredentialManager> credentialManagerSupplier,
         Client client,
         NamedXContentRegistry xContentRegistry,
         DatafeedConfigProvider datafeedConfigProvider
     ) {
         this.auditor = auditor;
-        this.apiKeyService = apiKeyService;
-        this.credentialManager = credentialManager;
+        this.apiKeyServiceSupplier = apiKeyServiceSupplier;
+        this.credentialManagerSupplier = credentialManagerSupplier;
         this.client = client;
         this.xContentRegistry = xContentRegistry;
         this.datafeedConfigProvider = datafeedConfigProvider;
@@ -124,7 +125,7 @@ public final class CredentialTransitions {
     }
 
     public boolean hasCloudManagedCredential(ThreadPool threadPool) {
-        return credentialManager.hasCloudManagedCredential(threadPool.getThreadContext());
+        return credentialManagerSupplier.get().hasCloudManagedCredential(threadPool.getThreadContext());
     }
 
     public void executeUpdate(
@@ -182,7 +183,7 @@ public final class CredentialTransitions {
             continuation.run();
             return;
         }
-        apiKeyService.revokeCloudAuthentication(cred, ActionListener.wrap(ignored -> {
+        apiKeyServiceSupplier.get().revokeCloudAuthentication(cred, ActionListener.wrap(ignored -> {
             auditor.info(config.getJobId(), Messages.getMessage(Messages.JOB_AUDIT_DATAFEED_CPS_KEY_REVOKED));
             cred.close();
             continuation.run();
@@ -297,7 +298,7 @@ public final class CredentialTransitions {
         DatafeedConfig patchedConfig,
         ActionListener<PutDatafeedAction.Response> listener
     ) {
-        apiKeyService.revokeCloudAuthentication(oldCredential, ActionListener.wrap(ignored -> {
+        apiKeyServiceSupplier.get().revokeCloudAuthentication(oldCredential, ActionListener.wrap(ignored -> {
             auditor.info(patchedConfig.getJobId(), Messages.getMessage(Messages.JOB_AUDIT_DATAFEED_CPS_KEY_REVOKED));
             oldCredential.close();
             listener.onResponse(new PutDatafeedAction.Response(patchedConfig));
@@ -367,9 +368,10 @@ public final class CredentialTransitions {
         BiConsumer<PersistedCloudCredential, Map<String, String>> onSuccess
     ) {
         useSecondaryAuthIfAvailable(securityContext, () -> {
-            CloudCredential callerCredential = credentialManager.extractCloudManagedCredential(threadPool.getThreadContext());
+            CloudCredential callerCredential = credentialManagerSupplier.get()
+                .extractCloudManagedCredential(threadPool.getThreadContext());
             Map<String, String> userHeaders = threadPool.getThreadContext().getHeaders();
-            apiKeyService.grantCloudAuthentication(
+            apiKeyServiceSupplier.get().grantCloudAuthentication(
                 callerCredential,
                 "datafeed:" + datafeedId,
                 ActionListener.wrap(
@@ -389,7 +391,7 @@ public final class CredentialTransitions {
     private <T> ActionListener<T> revokeKeyOnFailure(PersistedCloudCredential mintedCredential, String jobId, ActionListener<T> delegate) {
         return ActionListener.wrap(
             delegate::onResponse,
-            e -> apiKeyService.revokeCloudAuthentication(mintedCredential, ActionListener.wrap(ignored -> {
+            e -> apiKeyServiceSupplier.get().revokeCloudAuthentication(mintedCredential, ActionListener.wrap(ignored -> {
                 auditor.info(jobId, Messages.getMessage(Messages.JOB_AUDIT_DATAFEED_CPS_KEY_REVOKED));
                 mintedCredential.close();
                 delegate.onFailure(e);

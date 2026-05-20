@@ -111,8 +111,8 @@ public final class DatafeedManager {
         this.crossProjectModeDecider = new CrossProjectModeDecider(settings);
         this.credentialTransitions = new CredentialTransitions(
             Objects.requireNonNull(auditor),
-            Objects.requireNonNull(mlExtension).getCloudApiKeyService(),
-            mlExtension.getCloudCredentialManager(),
+            () -> Objects.requireNonNull(mlExtension).getCloudApiKeyService(),
+            () -> mlExtension.getCloudCredentialManager(),
             client,
             xContentRegistry,
             datafeedConfigProvider
