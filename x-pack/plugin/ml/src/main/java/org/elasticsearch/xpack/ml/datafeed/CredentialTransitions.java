@@ -35,6 +35,7 @@ import org.elasticsearch.xpack.ml.datafeed.persistence.DatafeedConfigProvider;
 import org.elasticsearch.xpack.ml.notifications.AnomalyDetectionAuditor;
 
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BiConsumer;
 import java.util.function.Supplier;
 
@@ -53,11 +54,15 @@ public final class CredentialTransitions {
     /**
      * How a datafeed config update should treat the persisted cloud internal credential envelope.
      */
-    public sealed interface Change permits Change.Keep, Change.Replace, Change.Clear {
+    public sealed interface Change permits Change.Keep, Change.Mint, Change.Clear {
 
         record Keep() implements Change {}
 
-        record Replace(PersistedCloudCredential newCredential) implements Change {}
+        /**
+         * Provides a hook that receives the applied {@link DatafeedConfig} and resolves the
+         * credential to persist (probe → mint → {@code credentialListener.onResponse}).
+         */
+        record Mint(BiConsumer<DatafeedConfig, ActionListener<PersistedCloudCredential>> mintHook) implements Change {}
 
         record Clear() implements Change {}
 
@@ -128,7 +133,6 @@ public final class CredentialTransitions {
     public void executeUpdate(
         Intent intent,
         UpdateDatafeedAction.Request request,
-        DatafeedConfig merged,
         String jobId,
         Map<String, String> headers,
         ThreadPool threadPool,
@@ -138,7 +142,7 @@ public final class CredentialTransitions {
     ) {
         switch (intent) {
             case CLEAR -> applyDowngrade(request, jobId, headers, validator, listener);
-            case REPLACE -> applyRekey(request, merged, jobId, threadPool, securityContext, validator, listener);
+            case REPLACE -> applyRekey(request, jobId, headers, threadPool, securityContext, validator, listener);
             case KEEP -> persistUpdateWithoutCredentialChange(request, headers, validator, listener);
         }
     }
@@ -157,13 +161,20 @@ public final class CredentialTransitions {
             String jobId = request.getDatafeed().getJobId();
             Map<String, String> headers = threadPool.getThreadContext().getHeaders();
             validateSearchBeforeMint(request.getDatafeed(), headers, listener.delegateFailureAndWrap((l, ignored) -> {
-                auditor.info(jobId, Messages.getMessage(Messages.JOB_AUDIT_DATAFEED_CPS_KEY_MINTED));
                 mintCpsKeyForDatafeed(datafeedId, threadPool, securityContext, l, (newCredential, userHeaders) -> {
                     DatafeedConfig.Builder builder = new DatafeedConfig.Builder(request.getDatafeed());
                     builder.setCloudInternalCredential(newCredential);
                     PutDatafeedAction.Request updatedRequest = new PutDatafeedAction.Request(builder.build());
                     updatedRequest.masterNodeTimeout(request.masterNodeTimeout());
-                    persistFn.put(updatedRequest, userHeaders, clusterState, revokeKeyOnFailure(newCredential, jobId, l));
+                    persistFn.put(
+                        updatedRequest,
+                        userHeaders,
+                        clusterState,
+                        revokeKeyOnFailure(newCredential, jobId, ActionListener.wrap(response -> {
+                            auditor.info(jobId, Messages.getMessage(Messages.JOB_AUDIT_DATAFEED_CPS_KEY_MINTED));
+                            l.onResponse(response);
+                        }, l::onFailure))
+                    );
                 });
             }));
         } else {
@@ -244,34 +255,63 @@ public final class CredentialTransitions {
         );
     }
 
+    /**
+     * Performs a re-key update: probe → mint (via {@link Change.Mint} hook inside the
+     * {@link DatafeedConfigProvider} transaction) → persist → audit REKEYED → revoke old key.
+     * If anything after the mint fails, the newly minted key is best-effort revoked.
+     */
     private void applyRekey(
         UpdateDatafeedAction.Request request,
-        DatafeedConfig merged,
         String jobId,
+        Map<String, String> headers,
         ThreadPool threadPool,
         SecurityContext securityContext,
         BiConsumer<DatafeedConfig, ActionListener<Boolean>> validator,
         ActionListener<PutDatafeedAction.Response> listener
     ) {
         String datafeedId = request.getUpdate().getId();
-        Map<String, String> headers = threadPool.getThreadContext().getHeaders();
-        validateSearchBeforeMint(
-            merged,
-            headers,
-            listener.delegateFailureAndWrap(
-                (l, ignored) -> mintCpsKeyForDatafeed(datafeedId, threadPool, securityContext, l, (newCredential, userHeaders) -> {
-                    auditor.info(jobId, Messages.getMessage(Messages.JOB_AUDIT_DATAFEED_CPS_KEY_REKEYED));
-                    ActionListener<PutDatafeedAction.Response> guardedListener = revokeKeyOnFailure(newCredential, jobId, l);
-                    datafeedConfigProvider.updateDatefeedConfig(
-                        datafeedId,
-                        request.getUpdate(),
-                        userHeaders,
-                        new Change.Replace(newCredential),
-                        validator,
-                        guardedListener.delegateFailureAndWrap((ll, tuple) -> finalizeRekey(datafeedId, tuple, ll))
-                    );
-                })
+        AtomicReference<PersistedCloudCredential> mintedCredRef = new AtomicReference<>();
+
+        // If a credential was minted but a subsequent step fails, revoke it best-effort
+        ActionListener<PutDatafeedAction.Response> guardedListener = ActionListener.wrap(listener::onResponse, e -> {
+            PersistedCloudCredential minted = mintedCredRef.get();
+            if (minted == null) {
+                listener.onFailure(e);
+                return;
+            }
+            apiKeyServiceSupplier.get().revokeCloudAuthentication(minted, ActionListener.wrap(ignored -> {
+                auditor.info(jobId, Messages.getMessage(Messages.JOB_AUDIT_DATAFEED_CPS_KEY_REVOKED));
+                minted.close();
+                listener.onFailure(e);
+            }, revokeFailure -> {
+                auditor.info(jobId, Messages.getMessage(Messages.JOB_AUDIT_DATAFEED_CPS_KEY_REVOCATION_FAILED, minted.id()));
+                minted.close();
+                listener.onFailure(e);
+            }));
+        });
+
+        // The hook is invoked by DatafeedConfigProvider after GET+apply, ensuring the probe
+        // and mint run against the single authoritative applied config (no duplicate apply).
+        Change.Mint mintChange = new Change.Mint(
+            (applied, credentialListener) -> validateSearchBeforeMint(
+                applied,
+                headers,
+                credentialListener.delegateFailureAndWrap(
+                    (cl, ignored) -> mintCpsKeyForDatafeed(datafeedId, threadPool, securityContext, cl, (newCred, userHeaders) -> {
+                        mintedCredRef.set(newCred);
+                        cl.onResponse(newCred);
+                    })
+                )
             )
+        );
+
+        datafeedConfigProvider.updateDatefeedConfig(
+            datafeedId,
+            request.getUpdate(),
+            headers,
+            mintChange,
+            validator,
+            guardedListener.delegateFailureAndWrap((l, tuple) -> finalizeRekey(datafeedId, tuple, l))
         );
     }
 
@@ -282,6 +322,7 @@ public final class CredentialTransitions {
     ) {
         DatafeedConfig updatedConfig = tuple.v1();
         PersistedCloudCredential oldCredential = tuple.v2();
+        auditor.info(updatedConfig.getJobId(), Messages.getMessage(Messages.JOB_AUDIT_DATAFEED_CPS_KEY_REKEYED));
         if (oldCredential != null) {
             bestEffortRevokeOldKey(datafeedId, oldCredential, updatedConfig, listener);
         } else {

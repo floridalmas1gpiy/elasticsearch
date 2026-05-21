@@ -7,14 +7,18 @@
 
 package org.elasticsearch.xpack.ml.datafeed;
 
-import org.elasticsearch.common.settings.SecureString;
+import org.elasticsearch.action.ActionListener;
 import org.elasticsearch.test.ESTestCase;
+import org.elasticsearch.xpack.core.ml.datafeed.DatafeedConfig;
 import org.elasticsearch.xpack.core.security.cloud.PersistedCloudCredential;
 import org.elasticsearch.xpack.ml.datafeed.CredentialTransitions.Change;
 import org.elasticsearch.xpack.ml.datafeed.CredentialTransitions.Intent;
 import org.elasticsearch.xpack.ml.datafeed.CredentialTransitions.TransitionContext;
 
+import java.util.function.BiConsumer;
+
 import static org.hamcrest.Matchers.equalTo;
+import static org.hamcrest.Matchers.notNullValue;
 import static org.hamcrest.Matchers.sameInstance;
 
 public class CredentialTransitionsTests extends ESTestCase {
@@ -69,9 +73,10 @@ public class CredentialTransitionsTests extends ESTestCase {
         assertThat(Change.CLEAR, sameInstance(Change.CLEAR));
     }
 
-    public void testReplaceShouldHoldCredential() {
-        PersistedCloudCredential credential = new PersistedCloudCredential("key-id", new SecureString("secret".toCharArray()));
-        Change.Replace replace = new Change.Replace(credential);
-        assertThat(replace.newCredential(), equalTo(credential));
+    public void testMintShouldHoldHook() {
+        BiConsumer<DatafeedConfig, ActionListener<PersistedCloudCredential>> hook = (config, listener) -> {};
+        Change.Mint mint = new Change.Mint(hook);
+        assertThat(mint.mintHook(), notNullValue());
+        assertThat(mint.mintHook(), equalTo(hook));
     }
 }

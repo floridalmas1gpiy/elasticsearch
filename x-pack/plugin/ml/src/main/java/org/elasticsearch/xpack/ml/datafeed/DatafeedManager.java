@@ -261,7 +261,6 @@ public final class DatafeedManager {
             datafeedConfigProvider.getDatafeedConfig(datafeedId, null, listener.delegateFailureAndWrap((l, configBuilder) -> {
                 try {
                     final DatafeedConfig current = configBuilder.build();
-                    final DatafeedConfig merged = update.apply(current, headers, state);
                     CredentialTransitions.TransitionContext ctx = new CredentialTransitions.TransitionContext(
                         crossProjectMlEnabled(),
                         hasCpsCredential,
@@ -272,7 +271,6 @@ public final class DatafeedManager {
                     credentialTransitions.executeUpdate(
                         intent,
                         request,
-                        merged,
                         current.getJobId(),
                         headers,
                         threadPool,

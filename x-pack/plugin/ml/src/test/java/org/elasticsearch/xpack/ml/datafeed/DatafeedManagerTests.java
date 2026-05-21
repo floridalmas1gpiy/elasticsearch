@@ -214,6 +214,40 @@ public class DatafeedManagerTests extends ESTestCase {
         }).when(provider).getDatafeedConfig(eq(config.getId()), isNull(), any());
     }
 
+    /**
+     * Simulates the {@link DatafeedConfigProvider#updateDatefeedConfigInternal} behaviour for the
+     * {@link CredentialTransitions.Change.Mint} arm: applies the update to {@code storedConfig},
+     * invokes the mint hook with the resulting config, then either returns a success tuple or
+     * propagates {@code persistFailureOrNull} after the hook completes.
+     */
+    @SuppressWarnings("unchecked")
+    private static void stubUpdateDatefeedConfigInvokesMintHook(
+        DatafeedConfigProvider mock,
+        DatafeedConfig storedConfig,
+        RuntimeException persistFailureOrNull
+    ) {
+        doAnswer(invocation -> {
+            CredentialTransitions.Change.Mint mint = invocation.getArgument(3);
+            DatafeedUpdate update = invocation.getArgument(1);
+            Map<String, String> headers = invocation.getArgument(2);
+            DatafeedConfig applied = update.apply(storedConfig, headers, mockClusterStateForUpdate());
+
+            ActionListener<PersistedCloudCredential> credentialListener = ActionListener.wrap(newCred -> {
+                if (persistFailureOrNull != null) {
+                    invocation.<ActionListener<Tuple<DatafeedConfig, PersistedCloudCredential>>>getArgument(5)
+                        .onFailure(persistFailureOrNull);
+                } else {
+                    DatafeedConfig persisted = new DatafeedConfig.Builder(applied).setCloudInternalCredential(newCred).build();
+                    invocation.<ActionListener<Tuple<DatafeedConfig, PersistedCloudCredential>>>getArgument(5)
+                        .onResponse(Tuple.tuple(persisted, storedConfig.getCloudInternalCredential()));
+                }
+            }, e -> invocation.<ActionListener<Tuple<DatafeedConfig, PersistedCloudCredential>>>getArgument(5).onFailure(e));
+
+            mint.mintHook().accept(applied, credentialListener);
+            return null;
+        }).when(mock).updateDatefeedConfig(anyString(), any(), any(), any(CredentialTransitions.Change.Mint.class), any(), any());
+    }
+
     private static ClusterState mockClusterStateWithNoTasks() {
         ClusterState clusterState = mock(ClusterState.class);
         Metadata metadata = mock(Metadata.class);
@@ -591,6 +625,7 @@ public class DatafeedManagerTests extends ESTestCase {
         existingBuilder.setIndices(List.of("logs-*"));
         withCpsSearchSurface(existingBuilder);
         stubGetDatafeedConfig(datafeedConfigProvider, existingBuilder.build());
+        stubUpdateDatefeedConfigInvokesMintHook(datafeedConfigProvider, existingBuilder.build(), null);
 
         DatafeedUpdate.Builder updateBuilder = new DatafeedUpdate.Builder("test-datafeed");
         updateBuilder.setIndices(List.of("new-logs-*"));
@@ -616,14 +651,6 @@ public class DatafeedManagerTests extends ESTestCase {
 
         assertThat(failure.get(), notNullValue());
         assertThat(failure.get(), equalTo(grantFailure));
-        verify(datafeedConfigProvider, never()).updateDatefeedConfig(
-            anyString(),
-            any(DatafeedUpdate.class),
-            any(Map.class),
-            any(Change.class),
-            any(),
-            any()
-        );
     }
 
     @SuppressWarnings("unchecked")
@@ -1006,6 +1033,7 @@ public class DatafeedManagerTests extends ESTestCase {
 
         RuntimeException probeFailure = new RuntimeException("search probe failed");
         mockSearchProbeFails(client, probeFailure);
+        stubUpdateDatefeedConfigInvokesMintHook(datafeedConfigProvider, existingBuilder.build(), null);
 
         DatafeedUpdate.Builder updateBuilder = new DatafeedUpdate.Builder("test-datafeed");
         updateBuilder.setIndices(List.of("new-logs-*"));
@@ -1056,6 +1084,7 @@ public class DatafeedManagerTests extends ESTestCase {
         stubGetDatafeedConfig(datafeedConfigProvider, existingBuilder.build());
 
         mockSearchProbeOkWithSkippedClusterSecurityFailure(client);
+        stubUpdateDatefeedConfigInvokesMintHook(datafeedConfigProvider, existingBuilder.build(), null);
 
         DatafeedUpdate.Builder updateBuilder = new DatafeedUpdate.Builder("test-datafeed");
         updateBuilder.setIndices(List.of("new-logs-*"));
@@ -1108,6 +1137,7 @@ public class DatafeedManagerTests extends ESTestCase {
 
         mockSearchProbeSucceeds(client);
         mockGrantFails(apiKeyService, new IOException("stop after probe"));
+        stubUpdateDatefeedConfigInvokesMintHook(datafeedConfigProvider, existingBuilder.build(), null);
 
         DatafeedUpdate.Builder updateBuilder = new DatafeedUpdate.Builder("test-datafeed");
         updateBuilder.setIndices(List.of("merged-*"));
@@ -1165,12 +1195,7 @@ public class DatafeedManagerTests extends ESTestCase {
         PersistedCloudCredential minted = new PersistedCloudCredential("minted-key", new SecureString("s".toCharArray()));
         mockGrantSucceeds(apiKeyService, minted);
         mockRevokeSucceeds(apiKeyService);
-
-        doAnswer(invocation -> {
-            ActionListener<Tuple<DatafeedConfig, PersistedCloudCredential>> listener = invocation.getArgument(5);
-            listener.onFailure(new RuntimeException("persist failed"));
-            return null;
-        }).when(datafeedConfigProvider).updateDatefeedConfig(anyString(), any(), any(), any(Change.Replace.class), any(), any());
+        stubUpdateDatefeedConfigInvokesMintHook(datafeedConfigProvider, existingBuilder.build(), new RuntimeException("persist failed"));
 
         DatafeedUpdate.Builder updateBuilder = new DatafeedUpdate.Builder("test-datafeed");
         updateBuilder.setIndices(List.of("new-logs-*"));
