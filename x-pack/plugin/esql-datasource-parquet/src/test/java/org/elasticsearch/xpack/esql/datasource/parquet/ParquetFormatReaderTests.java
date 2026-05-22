@@ -1716,6 +1716,33 @@ public class ParquetFormatReaderTests extends ESTestCase {
     }
 
     /**
+     * A signed INT32 value of -1 in Parquet must be sign-extended to -1L when the planner schema
+     * declares the column as LONG. Zero-extension would produce 4294967295L — incorrect.
+     */
+    public void testSignedInt32WideningToLong() throws Exception {
+        MessageType schema = Types.buildMessage().required(PrimitiveType.PrimitiveTypeName.INT32).named("x").named("test_schema");
+        byte[] parquetData = createParquetFile(schema, factory -> {
+            Group g = factory.newGroup();
+            g.add("x", -1);
+            return List.of(g);
+        });
+        StorageObject storageObject = createStorageObject(parquetData);
+        ParquetFormatReader reader = new ParquetFormatReader(blockFactory);
+        List<Attribute> plannerSchema = List.of(new ReferenceAttribute(Source.EMPTY, "x", DataType.LONG));
+        try (
+            CloseableIterator<Page> iterator = reader.read(
+                storageObject,
+                FormatReadContext.builder().projectedColumns(List.of("x")).batchSize(10).readSchema(plannerSchema).build()
+            )
+        ) {
+            assertTrue(iterator.hasNext());
+            Page page = iterator.next();
+            assertEquals(1, page.getPositionCount());
+            assertEquals(-1L, ((LongBlock) page.getBlock(0)).getLong(0));
+        }
+    }
+
+    /**
      * Parquet string-annotated BINARY maps to KEYWORD; planner KEYWORD is still readable (both ESQL strings).
      */
     public void testPlannerKeywordCompatibleWithTextParquetColumnReadRange() throws Exception {
@@ -2603,5 +2630,315 @@ public class ParquetFormatReaderTests extends ESTestCase {
         ParquetFormatReader reader = new ParquetFormatReader(blockFactory);
         assertSame(reader, reader.withConfig(null));
         assertSame(reader, reader.withConfig(Map.of()));
+    }
+
+    // --- Nested STRUCT subfield projection tests ---
+
+    public void testNestedStructFlattening() throws Exception {
+        MessageType schema = new MessageType(
+            "test_schema",
+            Types.optionalGroup()
+                .optional(PrimitiveType.PrimitiveTypeName.BINARY)
+                .as(LogicalTypeAnnotation.stringType())
+                .named("action")
+                .optional(PrimitiveType.PrimitiveTypeName.BINARY)
+                .as(LogicalTypeAnnotation.stringType())
+                .named("outcome")
+                .named("event")
+        );
+
+        byte[] parquetData = createParquetFile(schema, factory -> {
+            Group g = factory.newGroup();
+            Group ev = g.addGroup("event");
+            ev.append("action", "login");
+            ev.append("outcome", "success");
+            return List.of(g);
+        });
+
+        ParquetFormatReader reader = new ParquetFormatReader(blockFactory);
+        SourceMetadata metadata = reader.metadata(createStorageObject(parquetData));
+        List<Attribute> attrs = metadata.schema();
+        assertEquals(2, attrs.size());
+        assertEquals("event.action", attrs.get(0).name());
+        assertEquals(DataType.KEYWORD, attrs.get(0).dataType());
+        assertEquals("event.outcome", attrs.get(1).name());
+        assertEquals(DataType.KEYWORD, attrs.get(1).dataType());
+    }
+
+    public void testNestedStructDeepFlattening() throws Exception {
+        // three-level nesting a.b.c.x
+        MessageType schema = new MessageType(
+            "deep",
+            Types.optionalGroup()
+                .addField(
+                    Types.optionalGroup()
+                        .addField(Types.optionalGroup().optional(PrimitiveType.PrimitiveTypeName.INT32).named("x").named("c"))
+                        .named("b")
+                )
+                .named("a")
+        );
+        byte[] parquetData = createParquetFile(schema, factory -> {
+            Group g = factory.newGroup();
+            g.addGroup("a").addGroup("b").addGroup("c").append("x", 42);
+            return List.of(g);
+        });
+        ParquetFormatReader reader = new ParquetFormatReader(blockFactory);
+        SourceMetadata metadata = reader.metadata(createStorageObject(parquetData));
+        assertEquals(1, metadata.schema().size());
+        assertEquals("a.b.c.x", metadata.schema().get(0).name());
+        assertEquals(DataType.INTEGER, metadata.schema().get(0).dataType());
+    }
+
+    public void testNestedStructProjectionSingleSubfield() throws Exception {
+        MessageType schema = new MessageType(
+            "test_schema",
+            Types.required(PrimitiveType.PrimitiveTypeName.INT64).named("id"),
+            Types.optionalGroup()
+                .optional(PrimitiveType.PrimitiveTypeName.BINARY)
+                .as(LogicalTypeAnnotation.stringType())
+                .named("action")
+                .optional(PrimitiveType.PrimitiveTypeName.BINARY)
+                .as(LogicalTypeAnnotation.stringType())
+                .named("outcome")
+                .named("event")
+        );
+
+        byte[] parquetData = createParquetFile(schema, factory -> {
+            Group g = factory.newGroup();
+            g.add("id", 1L);
+            Group ev = g.addGroup("event");
+            ev.append("action", "login");
+            ev.append("outcome", "success");
+            return List.of(g);
+        });
+
+        ParquetFormatReader reader = new ParquetFormatReader(blockFactory);
+        StorageObject so = createStorageObject(parquetData);
+        try (CloseableIterator<Page> iterator = reader.read(so, List.of("event.action"), 10)) {
+            assertTrue(iterator.hasNext());
+            Page page = iterator.next();
+            assertEquals(1, page.getBlockCount());
+            assertEquals(1, page.getPositionCount());
+            BytesRefBlock block = (BytesRefBlock) page.getBlock(0);
+            assertEquals(new BytesRef("login"), block.getBytesRef(0, new BytesRef()));
+            page.releaseBlocks();
+        }
+    }
+
+    public void testNestedStructProjectionTwoSubfieldsSameParent() throws Exception {
+        MessageType schema = new MessageType(
+            "test_schema",
+            Types.optionalGroup()
+                .optional(PrimitiveType.PrimitiveTypeName.BINARY)
+                .as(LogicalTypeAnnotation.stringType())
+                .named("action")
+                .optional(PrimitiveType.PrimitiveTypeName.BINARY)
+                .as(LogicalTypeAnnotation.stringType())
+                .named("outcome")
+                .named("event")
+        );
+
+        byte[] parquetData = createParquetFile(schema, factory -> {
+            Group g = factory.newGroup();
+            Group ev = g.addGroup("event");
+            ev.append("action", "login");
+            ev.append("outcome", "success");
+            return List.of(g);
+        });
+
+        ParquetFormatReader reader = new ParquetFormatReader(blockFactory);
+        StorageObject so = createStorageObject(parquetData);
+        try (CloseableIterator<Page> iterator = reader.read(so, List.of("event.action", "event.outcome"), 10)) {
+            assertTrue(iterator.hasNext());
+            Page page = iterator.next();
+            assertEquals(2, page.getBlockCount());
+            assertEquals(new BytesRef("login"), ((BytesRefBlock) page.getBlock(0)).getBytesRef(0, new BytesRef()));
+            assertEquals(new BytesRef("success"), ((BytesRefBlock) page.getBlock(1)).getBytesRef(0, new BytesRef()));
+            page.releaseBlocks();
+        }
+    }
+
+    public void testNestedStructProjectionMixedTopLevelAndNested() throws Exception {
+        MessageType schema = new MessageType(
+            "test_schema",
+            Types.required(PrimitiveType.PrimitiveTypeName.INT64).named("id"),
+            Types.optionalGroup()
+                .optional(PrimitiveType.PrimitiveTypeName.BINARY)
+                .as(LogicalTypeAnnotation.stringType())
+                .named("action")
+                .named("event")
+        );
+        byte[] parquetData = createParquetFile(schema, factory -> {
+            Group g = factory.newGroup();
+            g.add("id", 7L);
+            g.addGroup("event").append("action", "logout");
+            return List.of(g);
+        });
+        ParquetFormatReader reader = new ParquetFormatReader(blockFactory);
+        StorageObject so = createStorageObject(parquetData);
+        try (CloseableIterator<Page> iterator = reader.read(so, List.of("id", "event.action"), 10)) {
+            assertTrue(iterator.hasNext());
+            Page page = iterator.next();
+            assertEquals(2, page.getBlockCount());
+            assertEquals(7L, ((LongBlock) page.getBlock(0)).getLong(0));
+            assertEquals(new BytesRef("logout"), ((BytesRefBlock) page.getBlock(1)).getBytesRef(0, new BytesRef()));
+            page.releaseBlocks();
+        }
+    }
+
+    public void testLiteralDottedNamePrecedence() throws Exception {
+        // Top-level primitive literally named "event.action"; projecting "event.action" must
+        // resolve to this field, not to a nested path.
+        MessageType schema = new MessageType(
+            "test_schema",
+            Types.optional(PrimitiveType.PrimitiveTypeName.BINARY).as(LogicalTypeAnnotation.stringType()).named("event.action")
+        );
+        byte[] parquetData = createParquetFile(schema, factory -> {
+            Group g = factory.newGroup();
+            g.append("event.action", "literal");
+            return List.of(g);
+        });
+        ParquetFormatReader reader = new ParquetFormatReader(blockFactory);
+        StorageObject so = createStorageObject(parquetData);
+        SourceMetadata metadata = reader.metadata(so);
+        assertEquals(1, metadata.schema().size());
+        assertEquals("event.action", metadata.schema().get(0).name());
+        try (CloseableIterator<Page> iterator = reader.read(so, List.of("event.action"), 10)) {
+            assertTrue(iterator.hasNext());
+            Page page = iterator.next();
+            assertEquals(new BytesRef("literal"), ((BytesRefBlock) page.getBlock(0)).getBytesRef(0, new BytesRef()));
+            page.releaseBlocks();
+        }
+    }
+
+    public void testNestedStructDepthCap() throws Exception {
+        // Synthesize a struct that exceeds MAX_STRUCT_FLATTENING_DEPTH; assert the over-cap group
+        // surfaces as a single UNSUPPORTED attribute (no infinite loop).
+        int over = ParquetFormatReader.MAX_STRUCT_FLATTENING_DEPTH + 4;
+        Type field = Types.optional(PrimitiveType.PrimitiveTypeName.INT32).named("leaf");
+        for (int i = 0; i < over; i++) {
+            field = Types.optionalGroup().addField(field).named("g" + i);
+        }
+        MessageType schema = new MessageType("deep_schema", field);
+
+        // No data needed; we only inspect metadata. Write an empty row group via no rows.
+        byte[] parquetData = createParquetFile(schema, factory -> List.of());
+        ParquetFormatReader reader = new ParquetFormatReader(blockFactory);
+        SourceMetadata metadata = reader.metadata(createStorageObject(parquetData));
+        // Once recursion crosses the cap, the over-cap group is emitted as one UNSUPPORTED
+        // attribute and recursion stops; deeper leaves never surface. So we expect exactly one
+        // attribute, UNSUPPORTED, whose dotted name has cap+1 segments (the cap-exceeding group
+        // itself; everything below it is collapsed).
+        assertEquals(1, metadata.schema().size());
+        Attribute attr = metadata.schema().get(0);
+        assertEquals(DataType.UNSUPPORTED, attr.dataType());
+        assertEquals(
+            "expected name with cap+1 segments (the first over-cap level)",
+            ParquetFormatReader.MAX_STRUCT_FLATTENING_DEPTH + 1,
+            attr.name().split("\\.").length
+        );
+    }
+
+    public void testNestedStructEndToEndWithThreeWayNullPropagation() throws Exception {
+        // OPTIONAL event { OPTIONAL action, OPTIONAL outcome }; rows cover:
+        // (a) parent null
+        // (b) parent non-null, action null
+        // (c) both non-null
+        MessageType schema = new MessageType(
+            "test_schema",
+            Types.optionalGroup()
+                .optional(PrimitiveType.PrimitiveTypeName.BINARY)
+                .as(LogicalTypeAnnotation.stringType())
+                .named("action")
+                .optional(PrimitiveType.PrimitiveTypeName.BINARY)
+                .as(LogicalTypeAnnotation.stringType())
+                .named("outcome")
+                .named("event")
+        );
+        byte[] parquetData = createParquetFile(schema, factory -> {
+            Group g1 = factory.newGroup(); // (a) parent null — no addGroup call
+            Group g2 = factory.newGroup(); // (b) parent non-null, action null
+            g2.addGroup("event").append("outcome", "success");
+            Group g3 = factory.newGroup(); // (c) both non-null
+            Group ev3 = g3.addGroup("event");
+            ev3.append("action", "logout");
+            ev3.append("outcome", "failure");
+            return List.of(g1, g2, g3);
+        });
+        ParquetFormatReader reader = new ParquetFormatReader(blockFactory);
+        StorageObject so = createStorageObject(parquetData);
+        try (CloseableIterator<Page> iterator = reader.read(so, List.of("event.action"), 10)) {
+            assertTrue(iterator.hasNext());
+            Page page = iterator.next();
+            assertEquals(3, page.getPositionCount());
+            BytesRefBlock block = (BytesRefBlock) page.getBlock(0);
+            assertTrue("row 0 (parent null) -> child null", block.isNull(0));
+            assertTrue("row 1 (parent non-null, child null) -> child null", block.isNull(1));
+            assertFalse("row 2 (both non-null) -> non-null", block.isNull(2));
+            assertEquals(new BytesRef("logout"), block.getBytesRef(block.getFirstValueIndex(2), new BytesRef()));
+            page.releaseBlocks();
+        }
+    }
+
+    // UINT_32: value 3,000,000,000 overflows signed int to -1,294,967,296
+    public void testLargeUint32() throws Exception {
+        var schema = Types.buildMessage()
+            .required(PrimitiveType.PrimitiveTypeName.INT32)
+            .as(LogicalTypeAnnotation.intType(32, false)) // unsigned
+            .named("object_id")
+            .named("test_schema");
+        int unsignedBits = 0xFFFFFFFF; // negative in signed int
+        byte[] data = createParquetFile(schema, f -> List.of(f.newGroup().append("object_id", unsignedBits)));
+        StorageObject storageObject = createStorageObject(data);
+        ParquetFormatReader reader = new ParquetFormatReader(blockFactory);
+        var meta = reader.metadata(storageObject);
+        assertEquals("UINT_32 should map to LONG to hold unsigned 32-bit range", DataType.LONG, meta.schema().get(0).dataType());
+        try (CloseableIterator<Page> iterator = reader.read(storageObject, null, 10)) {
+            assertTrue(iterator.hasNext());
+            Page page = iterator.next();
+            assertEquals(0xFFFFFFFFL, ((LongBlock) page.getBlock(0)).getLong(0));
+            assertFalse(iterator.hasNext());
+        }
+    }
+
+    // UINT_8: value 200 should be read as such
+    public void testLargeUint8() throws Exception {
+        var schema = Types.buildMessage()
+            .required(PrimitiveType.PrimitiveTypeName.INT32)
+            .as(LogicalTypeAnnotation.intType(8, false)) // unsigned
+            .named("object_id")
+            .named("test_schema");
+        int unsignedBits = 200;
+        byte[] data = createParquetFile(schema, f -> List.of(f.newGroup().append("object_id", unsignedBits)));
+        StorageObject storageObject = createStorageObject(data);
+        ParquetFormatReader reader = new ParquetFormatReader(blockFactory);
+        var meta = reader.metadata(storageObject);
+        assertEquals("UINT_8 should map to INT to hold unsigned 8-bit range", DataType.INTEGER, meta.schema().get(0).dataType());
+        try (CloseableIterator<Page> iterator = reader.read(storageObject, null, 10)) {
+            assertTrue(iterator.hasNext());
+            Page page = iterator.next();
+            assertEquals(200, ((IntBlock) page.getBlock(0)).getInt(0));
+            assertFalse(iterator.hasNext());
+        }
+    }
+
+    public void testLargeUnsignedLong() throws Exception {
+        var schema = Types.buildMessage()
+            .required(PrimitiveType.PrimitiveTypeName.INT64)
+            .as(LogicalTypeAnnotation.intType(64, false)) // unsigned
+            .named("object_id")
+            .named("test_schema");
+        long unsignedBits = 0xFFFFFFFFFFFFFFFFL; // negative in signed long
+        byte[] data = createParquetFile(schema, f -> List.of(f.newGroup().append("object_id", unsignedBits)));
+        StorageObject storageObject = createStorageObject(data);
+        ParquetFormatReader reader = new ParquetFormatReader(blockFactory);
+        var meta = reader.metadata(storageObject);
+        assertEquals("UINT_64 should map to UNSIGNED_LONG", DataType.UNSIGNED_LONG, meta.schema().get(0).dataType());
+        try (CloseableIterator<Page> iterator = reader.read(storageObject, null, 10)) {
+            assertTrue(iterator.hasNext());
+            Page page = iterator.next();
+            assertEquals(unsignedBits, ((LongBlock) page.getBlock(0)).getLong(0));
+            assertFalse(iterator.hasNext());
+        }
     }
 }
